@@ -415,9 +415,7 @@ if {[exec uname] eq {Linux}} {
         # The socket:* targets of $pid's fds. Both calls are guarded: /proc/<pid>/fd, and single fds, can vanish.
         proc socket_links {pid} {
             set links {}
-            if {[catch {set fds [glob -tails -directory "/proc/$pid/fd" *]}]} {
-                return $links
-            }
+            if {[catch {set fds [glob -tails -directory "/proc/$pid/fd" *]}]} { return $links }
             foreach fd $fds {
                 if {[catch {set link [file readlink "/proc/$pid/fd/$fd"]}]} { continue }
                 if {[string match "socket:*" $link]} { lappend links $link }
@@ -439,11 +437,7 @@ if {[exec uname] eq {Linux}} {
             set victim_link [file readlink "/proc/$parent_pid/fd/$victim_fd"]
             assert_match {socket:*} $victim_link
             r bgsave
-            wait_for_condition 1000 10 {
-                [s rdb_bgsave_in_progress] eq 1
-            } else {
-                fail "bgsave did not start in time"
-            }
+            wait_for_condition 1000 10 { [s rdb_bgsave_in_progress] eq 1 } else { fail "bgsave did not start in time" }
             set child_pid [get_child_pid 0]
 
             # Watch the live child: a dead pid has no /proc/<pid>/fd at all, so an
@@ -457,19 +451,25 @@ if {[exec uname] eq {Linux}} {
                 }
                 after 10
             }
-            if {!$released} {
-                fail "BGSAVE child exited while still holding the client socket"
-            }
+            if {!$released} { fail "BGSAVE child exited while still holding the client socket" }
             pause_process $child_pid
-            wait_for_condition 100 100 {
-                [lsearch -inline [split [r client list] "\r\n"] *name=victim*] eq {}
-            } else {
-                fail "idle client was not closed by the parent"
+            # Resume the stopped child even if an observation below fails: the harness
+            # abandons the rest of a test body at the first throw, and start_server
+            # teardown signals only the registered parent, never this child, so a
+            # regression caught here must not leave a stopped process behind.
+            if {[catch {
+                wait_for_condition 100 100 {
+                    [lsearch -inline [split [r client list] "\r\n"] *name=victim*] eq {}
+                } else { fail "idle client was not closed by the parent" }
+                # The save is still running, yet neither process holds the socket now.
+                assert_equal [s rdb_bgsave_in_progress] 1
+                assert_equal -1 [lsearch -exact [socket_links $child_pid] $victim_link]
+                assert_equal -1 [lsearch -exact [socket_links $parent_pid] $victim_link]
+            } observed]} {
+                set einfo $::errorInfo
+                catch {exec kill -SIGCONT $child_pid}
+                error $observed $einfo
             }
-            # The save is still running, yet neither process holds the socket now.
-            assert_equal [s rdb_bgsave_in_progress] 1
-            assert_equal -1 [lsearch -exact [socket_links $child_pid] $victim_link]
-            assert_equal -1 [lsearch -exact [socket_links $parent_pid] $victim_link]
             resume_process $child_pid
             waitForBgsave r
             assert_equal [s rdb_last_bgsave_status] {ok}
