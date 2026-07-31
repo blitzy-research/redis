@@ -1903,6 +1903,43 @@ void unlinkClient(client *c) {
     if (c->flags & CLIENT_TRACKING) disableTracking(c);
 }
 
+/* Release the client sockets a persistence child inherited from the parent.
+ *
+ * fork() duplicates the descriptor table, so every accepted client socket is
+ * referenced twice as soon as a child exists: once by the parent and once by
+ * the child. The kernel tears a connection down, and emits the FIN, only on
+ * the last close of the socket, so while a child is alive the close() the
+ * parent performs when it reaps a client -- most commonly from the idle
+ * timeout in clientsCronHandleTimeout() -- cannot complete the teardown: the
+ * client disappears from CLIENT LIST while its connection stays alive, pinned
+ * by the child, and the peer is left with a socket that looks writable but is
+ * never served. Releasing the inherited descriptors here makes the parent's
+ * close the last one again, so teardown behaves exactly as it does when no
+ * child is alive.
+ *
+ * Only the raw descriptor is closed: connClose() would delete file events
+ * from an event loop this process no longer runs, free the connection and
+ * dirty copy-on-write pages the child is engineered to keep clean, and for
+ * TLS it would run SSL_shutdown() and write a close_notify onto a socket the
+ * parent still owns. Replica connections are skipped because this very child
+ * may stream the RDB payload straight into them during a diskless full sync;
+ * MONITOR clients carry CLIENT_SLAVE too and are skipped by the same test. */
+void closeChildUnusedClientSockets(void) {
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.clients,&li);
+    while((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        /* Fake clients (Lua, AOF loading, modules) have no connection. */
+        if (c->conn == NULL) continue;
+        /* Kept open: the child itself may write to replicas. */
+        if (c->flags & CLIENT_SLAVE) continue;
+        if (c->conn->fd == -1) continue;
+        close(c->conn->fd); /* Don't care if this fails. */
+    }
+}
+
 /* Remove client from the list of clients with pending referenced replies.
  * This is called when the client has finished sending all pending replies,
  * or when the client is being freed.
