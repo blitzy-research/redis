@@ -410,6 +410,77 @@ start_server {tags {"timeout external:skip"}} {
     }
 }
 
+if {[exec uname] eq {Linux}} {
+    start_server {tags {"timeout external:skip needs:debug needs:save"}} {
+        # The socket:* targets of $pid's fds. Both calls are guarded: /proc/<pid>/fd, and single fds, can vanish.
+        proc socket_links {pid} {
+            set links {}
+            if {[catch {set fds [glob -tails -directory "/proc/$pid/fd" *]}]} {
+                return $links
+            }
+            foreach fd $fds {
+                if {[catch {set link [file readlink "/proc/$pid/fd/$fd"]}]} { continue }
+                if {[string match "socket:*" $link]} { lappend links $link }
+            }
+            return $links
+        }
+
+        # fork() duplicates the descriptor table and the kernel tears a connection down
+        # only on the last close, so a live child holding a reaped client's socket pins it.
+        test {Idle client socket is released by the BGSAVE child} {
+            set parent_pid [srv 0 pid]
+            r config set timeout 1
+            r config set rdb-key-save-delay 200
+            r debug populate 10000
+            # Never touched again, so lastinteraction ages and the parent reaps it.
+            set victim [redis_client]
+            $victim client setname victim
+            assert {[regexp {fd=(\d+)} [$victim client info] -> victim_fd]}
+            set victim_link [file readlink "/proc/$parent_pid/fd/$victim_fd"]
+            assert_match {socket:*} $victim_link
+            r bgsave
+            wait_for_condition 1000 10 {
+                [s rdb_bgsave_in_progress] eq 1
+            } else {
+                fail "bgsave did not start in time"
+            }
+            set child_pid [get_child_pid 0]
+
+            # Watch the live child: a dead pid has no /proc/<pid>/fd at all, so an
+            # unguarded lsearch would read "released" the moment the child exits.
+            set released 0
+            for {set i 0} {$i < 1000} {incr i} {
+                if {![process_is_alive $child_pid]} break
+                if {[lsearch -exact [socket_links $child_pid] $victim_link] == -1 && [process_is_alive $child_pid]} {
+                    set released 1
+                    break
+                }
+                after 10
+            }
+            if {!$released} {
+                fail "BGSAVE child exited while still holding the client socket"
+            }
+            pause_process $child_pid
+            wait_for_condition 100 100 {
+                [lsearch -inline [split [r client list] "\r\n"] *name=victim*] eq {}
+            } else {
+                fail "idle client was not closed by the parent"
+            }
+            # The save is still running, yet neither process holds the socket now.
+            assert_equal [s rdb_bgsave_in_progress] 1
+            assert_equal -1 [lsearch -exact [socket_links $child_pid] $victim_link]
+            assert_equal -1 [lsearch -exact [socket_links $parent_pid] $victim_link]
+            resume_process $child_pid
+            waitForBgsave r
+            assert_equal [s rdb_last_bgsave_status] {ok}
+            assert_equal [r dbsize] 10000
+            catch {$victim close}
+            r config set rdb-key-save-delay 0
+            r flushall
+        }
+    }
+}
+
 test {Pending command pool expansion and shrinking} {
     start_server {overrides {loglevel debug io-threads 1} tags {external:skip}} {
         set rd1 [redis_deferring_client]
