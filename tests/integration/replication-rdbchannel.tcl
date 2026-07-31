@@ -932,10 +932,10 @@ start_server {tags {"repl external:skip"}} {
             $victim client setname victim
             $replica replicaof $master_host $master_port
 
-            # The victim must be gone while the transferring child is alive.
+            # The victim must be gone while the transferring child is alive: absence is monotonic, so it is sampled before the live child.
             wait_for_condition 100 100 {
-                [s 0 rdb_bgsave_in_progress] == 1 &&
-                [lsearch -inline [split [$master client list] "\r\n"] *name=victim*] eq {}
+                [lsearch -inline [split [$master client list] "\r\n"] *name=victim*] eq {} &&
+                [s 0 rdb_bgsave_in_progress] == 1
             } else {
                 fail "idle client was not reaped while the sync child was alive"
             }
