@@ -7208,6 +7208,19 @@ void setupChildSignalHandlers(void) {
  * parent restarts it can bind/lock despite the child possibly still running. */
 void closeChildUnusedResourceAfterFork(void) {
     closeListeningSockets(0);
+
+    /* Release the client sockets this child inherited: the parent keeps
+     * serving those clients and this child never writes to them, so keeping the
+     * duplicated descriptors would only prevent the parent's close() from
+     * tearing those connections down until the child exits. Persistence
+     * children only: a module child runs opaque user code, and a Lua debugger
+     * child serves its own client (see ldbStartSession() in eval.c). */
+    if (server.in_fork_child == CHILD_TYPE_RDB ||
+        server.in_fork_child == CHILD_TYPE_AOF)
+    {
+        closeChildUnusedClientSockets();
+    }
+
     if (server.cluster_enabled && server.cluster_config_file_lock_fd != -1)
         close(server.cluster_config_file_lock_fd);  /* don't care if this fails */
 
