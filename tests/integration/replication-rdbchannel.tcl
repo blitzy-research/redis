@@ -921,7 +921,7 @@ start_server {tags {"repl external:skip"}} {
             $replica config set repl-diskless-sync yes
             $replica config set repl-rdb-channel yes
 
-            # 200us per key keeps the transferring child alive while it is reaped.
+            # 200us per key keeps the transferring child alive while the idle victim times out.
             $master config set rdb-key-save-delay 200
             $master config set timeout 1
             populate 10000 master 1
@@ -932,7 +932,7 @@ start_server {tags {"repl external:skip"}} {
             $victim client setname victim
             $replica replicaof $master_host $master_port
 
-            # The victim must be gone while the transferring child is alive: absence is monotonic, so it is sampled before the live child.
+            # Check monotonic victim absence before verifying the sync child is still alive.
             wait_for_condition 100 100 {
                 [lsearch -inline [split [$master client list] "\r\n"] *name=victim*] eq {} &&
                 [s 0 rdb_bgsave_in_progress] == 1
