@@ -412,7 +412,7 @@ start_server {tags {"timeout external:skip"}} {
 
 if {[exec uname] eq {Linux}} {
     start_server {tags {"timeout external:skip needs:debug needs:save"}} {
-        # The socket:* targets of $pid's fds. Both calls are guarded: /proc/<pid>/fd, and single fds, can vanish.
+        # Socket-link lookup tolerates /proc/$pid/fd and individual descriptors disappearing.
         proc socket_links {pid} {
             set links {}
             if {[catch {set fds [glob -tails -directory "/proc/$pid/fd" *]}]} { return $links }
@@ -430,7 +430,7 @@ if {[exec uname] eq {Linux}} {
             r config set timeout 1
             r config set rdb-key-save-delay 200
             r debug populate 10000
-            # Never touched again, so lastinteraction ages and the parent reaps it.
+            # CLIENT INFO is the final victim command; afterward it idles until the parent reaps it.
             set victim [redis_client]
             $victim client setname victim
             assert {[regexp {fd=(\d+)} [$victim client info] -> victim_fd]}
@@ -456,7 +456,7 @@ if {[exec uname] eq {Linux}} {
             # Resume the stopped child even if an observation below fails: the harness
             # abandons the rest of a test body at the first throw, and start_server
             # teardown signals only the registered parent, never this child, so a
-            # regression caught here must not leave a stopped process behind.
+            # failed assertion must not leave a stopped process behind.
             if {[catch {
                 wait_for_condition 100 100 {
                     [lsearch -inline [split [r client list] "\r\n"] *name=victim*] eq {}
