@@ -902,3 +902,52 @@ start_server {tags {"repl external:skip tsan:skip"}} {
         }
     }
 }
+
+# The child of a diskless full sync writes the RDB payload straight into the
+# replica socket: rdbSaveToSlavesSockets() collects the replica connections
+# before the fork and the child writes into them with rioInitWithConnset()
+# (src/rdb.c), so replica connections must survive closeChildUnusedClientSockets().
+start_server {tags {"repl external:skip"}} {
+    set replica [srv 0 client]
+
+    start_server {} {
+        set master [srv 0 client]
+        set master_host [srv 0 host]
+        set master_port [srv 0 port]
+
+        test "Rdbchannel replica is served while the master closes an idle client" {
+            $master config set repl-diskless-sync yes
+            $master config set repl-rdb-channel yes
+            $replica config set repl-diskless-sync yes
+            $replica config set repl-rdb-channel yes
+
+            # 200us per key keeps the transferring child alive while the idle victim times out.
+            $master config set rdb-key-save-delay 200
+            $master config set timeout 1
+            populate 10000 master 1
+
+            # An idle victim, never used again so lastinteraction ages and
+            # clientsCronHandleTimeout() reaps it (the replica link is exempt).
+            set victim [redis_client]
+            $victim client setname victim
+            $replica replicaof $master_host $master_port
+
+            # Check monotonic victim absence before verifying the sync child is still alive.
+            wait_for_condition 100 100 {
+                [lsearch -inline [split [$master client list] "\r\n"] *name=victim*] eq {} &&
+                [s 0 rdb_bgsave_in_progress] == 1
+            } else {
+                fail "idle client was not reaped while the sync child was alive"
+            }
+
+            # The replica connection survived the release: the sync completed.
+            wait_replica_online $master 0 100 100
+            wait_for_ofs_sync $master $replica
+            assert_equal [s 0 sync_full] 1
+            assert_equal [$replica dbsize] 10000
+            assert_equal [$master debug digest] [$replica debug digest]
+            catch {$victim close}
+            $master config set rdb-key-save-delay 0
+        }
+    }
+}
